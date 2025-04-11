@@ -60,6 +60,13 @@ module pcileech_pcie_cfg_a7 #(
     reg        cfg_int_valid;       // Interrupt valid signal
     reg        cfg_int_stat;        // Interrupt status
     wire       cfg_int_ready = ctx.cfg_interrupt_rdy;
+
+        // BAR access detection signals
+    reg bar_read_detected;
+    reg bar_write_detected;
+    wire bar_activity = bar_read_detected || bar_write_detected || event_trigger;  // Include external events
+    
+
     
     // Interrupt counters
     reg [17:0] static_int_cnt = 0;  // Counter for fixed-interval "heartbeat" interrupts
@@ -130,6 +137,30 @@ module pcileech_pcie_cfg_a7 #(
         base_address_register_pipe <= base_address_register_reg;
     assign base_address_register = base_address_register_pipe;
 
+    // BAR access detection
+    always @(posedge clk_pcie) begin
+        if (rst) begin
+            bar_read_detected <= 1'b0;
+            bar_write_detected <= 1'b0;
+        end else begin
+            // Detect BAR reads
+            if (in_cmd_read && (base_address_register_reg == i_addr)) begin
+                bar_read_detected <= 1'b1;
+                cfg_int_di <= 8'h02;  // Code for BAR read
+            end else begin
+                bar_read_detected <= 1'b0;
+            end
+    
+            // Detect BAR writes
+            if (in_cmd_write && (base_address_register_reg == i_addr)) begin
+                bar_write_detected <= 1'b1;
+                cfg_int_di <= 8'h03;  // Code for BAR write
+            end else begin
+                bar_write_detected <= 1'b0;
+            end
+        end
+    end
+
     // ------------------------------------------------------------------------
     // Interrupt Control Logic
     // ------------------------------------------------------------------------
@@ -169,27 +200,34 @@ module pcileech_pcie_cfg_a7 #(
                   (static_int_trigger || (dynamic_int_pending && dynamic_int_allowed));
 
     // MSI interrupt control
-    always @(posedge clk_pcie) begin
-        if (rst) begin
-            cfg_int_valid <= 1'b0;
-            cfg_msg_num <= 5'b0;
-            cfg_int_assert <= 1'b0;
-            cfg_int_di <= 8'b0;
-            cfg_int_stat <= 1'b0;
-        end else if (cfg_int_ready && cfg_int_valid) begin
-            // Clear interrupt when acknowledged
-            cfg_int_valid <= 1'b0;
-            cfg_int_assert <= 1'b0;
-            cfg_int_stat <= 1'b0;
-        end else if (o_int) begin
-            // Generate interrupt
-            cfg_int_valid <= 1'b1;
-            cfg_int_assert <= 1'b1;
-            cfg_msg_num <= static_int_trigger ? 5'h0 : 5'h1; // Different vectors for static/dynamic
+always @(posedge clk_pcie) begin
+    if (rst) begin
+        cfg_int_valid <= 1'b0;
+        cfg_msg_num <= 5'b0;
+        cfg_int_assert <= 1'b0;
+        cfg_int_di <= 8'b0;
+        cfg_int_stat <= 1'b0;
+    end else if (cfg_int_ready && cfg_int_valid) begin
+        // Clear interrupt when acknowledged
+        cfg_int_valid <= 1'b0;
+        cfg_int_assert <= 1'b0;
+        cfg_int_stat <= 1'b0;
+    end else if (o_int) begin
+        // Generate interrupt
+        cfg_int_valid <= 1'b1;
+        cfg_int_assert <= 1'b1;
+        cfg_msg_num <= static_int_trigger ? 5'h0 : 5'h1; // Different vectors for static/dynamic
+        
+        // Only set interrupt data if it's not a BAR access
+        if (!bar_activity) begin
             cfg_int_di <= static_int_trigger ? 8'h00 : 8'h01; // Different data for static/dynamic
-            cfg_int_stat <= 1'b1;
         end
+        // Note: BAR access interrupt data (8'h02 or 8'h03) is set in the BAR detection block
+        
+        cfg_int_stat <= 1'b1;
     end
+end
+
    
      // ------------------------------------------------------------------------
     // REGISTER FILE: READ-ONLY LAYOUT/SPECIFICATION
@@ -382,7 +420,14 @@ module pcileech_pcie_cfg_a7 #(
     assign ctx.tx_cfg_gnt                   = rw[219];
     
     assign pcie_id                          = ro[79:64];
-    
+
+    // TLP Interface Assignments
+    assign tlps_static.tdata = 128'h0;
+    assign tlps_static.tkeepdw = 4'h0;
+    assign tlps_static.tlast = 1'b0;
+    assign tlps_static.tuser = 1'b0;
+    assign tlps_static.tvalid = 1'b0;
+    assign tlps_static.has_data = 1'b0;
     // ------------------------------------------------------------------------
     // Command and Status Register Handling
     // ------------------------------------------------------------------------
