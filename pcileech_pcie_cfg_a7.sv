@@ -2,15 +2,18 @@
 // PCILeech FPGA.
 //
 // PCIe configuration module - CFG handling for Artix-7.
-// 
+//
 // (c) Ulf Frisk, 2018-2024
 // Author: Ulf Frisk, pcileech@frizk.net
-// MSIX TLP Author: AceKingSuited    ( https://discord.gg/E32e7Yca )
-//                  Kilmu1337       （ https://discord.gg/sXeTPJfpaN ）              
+//
 `timescale 1ns / 1ps
 `include "pcileech_header.svh"
 
-module pcileech_pcie_cfg_a7(
+module pcileech_pcie_cfg_a7 #(
+    parameter CLOCK_FREQ_MHZ = 62,                    // Clock frequency in MHz
+    parameter STATIC_INT_PERIOD_US = 4000,            // Static interrupt period in microseconds
+    parameter INT_MIN_INTERVAL_US = 100               // Minimum interval between dynamic interrupts
+) (
     input                   rst,
     input                   clk_sys,
     input                   clk_pcie,
@@ -20,21 +23,23 @@ module pcileech_pcie_cfg_a7(
     input                   i_valid,
     input [31:0]            i_addr,
     input [31:0]            i_data,
- //   output wire             o_int,
     input                   int_enable,
+    input                   dynamic_int_mode,         // 1 = dynamic interrupts, 0 = fixed interval
+    input                   event_trigger,            // Signal to trigger dynamic interrupt
     output [15:0]           pcie_id,
     output wire [31:0]      base_address_register
-    );
+);
 
-    // ----------------------------------------------------
-    // TickCount64
-    // ----------------------------------------------------
+    // Parameters for interrupt timing
+    localparam INT_STATIC_COUNT = (CLOCK_FREQ_MHZ * STATIC_INT_PERIOD_US);
+    localparam INT_MIN_COUNT = (CLOCK_FREQ_MHZ * INT_MIN_INTERVAL_US);
+
+    // Optimize counter for timing checks
+    reg [1:0] tick_count = 0;
+    always @ (posedge clk_pcie)
+        tick_count <= tick_count + 1;
     
-    time tickcount64 = 0;
-    always @ ( posedge clk_pcie )
-        tickcount64 <= tickcount64 + 1;
-    
-    // ----------------------------------------------------------------------------
+     // ----------------------------------------------------------------------------
     // Convert received CFG data from FT601 to PCIe clock domain
     // FIFO depth: 512 / 64-bits
     // ----------------------------------------------------------------------------
@@ -47,7 +52,25 @@ module pcileech_pcie_cfg_a7(
     wire [31:0]     in_data32   = in_data64[63:32];
     wire [15:0]     in_data16   = in_data64[31:16];
     wire [3:0]      in_type     = in_data64[15:12];
-	
+    
+    // Interrupt control registers
+    reg [7:0]  cfg_int_di;          // Interrupt data
+    reg [4:0]  cfg_msg_num;         // MSI vector number
+    reg        cfg_int_assert;      // Interrupt assert signal
+    reg        cfg_int_valid;       // Interrupt valid signal
+    reg        cfg_int_stat;        // Interrupt status
+    wire       cfg_int_ready = ctx.cfg_interrupt_rdy;
+    
+    // Interrupt counters
+    reg [17:0] static_int_cnt = 0;  // Counter for fixed-interval "heartbeat" interrupts
+    reg [17:0] dynamic_int_cnt = 0; // Counter for minimum spacing between dynamic interrupts
+    reg        dynamic_int_pending = 0; // Flag for pending dynamic interrupt
+    
+    // Combined interrupt trigger
+    wire static_int_trigger = (static_int_cnt == INT_STATIC_COUNT-1);
+    wire dynamic_int_allowed = (dynamic_int_cnt >= INT_MIN_COUNT-1);
+    wire o_int;
+
     fifo_64_64 i_fifo_pcie_cfg_tx(
         .rst            ( rst                   ),
         .wr_clk         ( clk_sys               ),
@@ -60,8 +83,9 @@ module pcileech_pcie_cfg_a7(
         .empty          ( in_empty              ),
         .valid          ( in_valid              )
     );
+
     
-    // ------------------------------------------------------------------------
+   // ------------------------------------------------------------------------
     // Convert received CFG from PCIe core and transmit onwards to FT601
     // FIFO depth: 512 / 64-bits.
     // ------------------------------------------------------------------------
@@ -97,18 +121,81 @@ module pcileech_pcie_cfg_a7(
     reg     [9:0]       rwi_cfgrd_addr;
     reg     [3:0]       rwi_cfgrd_byte_en;
     reg     [31:0]      rwi_cfgrd_data;
-    reg                 rwi_tlp_static_valid;
-    reg                 rwi_tlp_static_2nd;
-    reg                 rwi_tlp_static_has_data;
     reg     [31:0]      rwi_count_cfgspace_status_cl;
     bit     [31:0]      base_address_register_reg;
-   
+    
+    // Pipeline register for improved timing
+    reg [31:0] base_address_register_pipe;
+    always @(posedge clk_pcie)
+        base_address_register_pipe <= base_address_register_reg;
+    assign base_address_register = base_address_register_pipe;
+
     // ------------------------------------------------------------------------
+    // Interrupt Control Logic
+    // ------------------------------------------------------------------------
+    
+    // Static "heartbeat" interrupt counter
+    always @(posedge clk_pcie) begin
+        if (rst || !int_enable) begin
+            static_int_cnt <= 0;
+        end else if (static_int_cnt >= INT_STATIC_COUNT-1) begin
+            static_int_cnt <= 0;
+        end else begin
+            static_int_cnt <= static_int_cnt + 1;
+        end
+    end
+
+    // Dynamic interrupt spacing counter
+    always @(posedge clk_pcie) begin
+        if (rst || !int_enable) begin
+            dynamic_int_cnt <= 0;
+            dynamic_int_pending <= 0;
+        end else begin
+            if (dynamic_int_cnt < INT_MIN_COUNT-1) begin
+                dynamic_int_cnt <= dynamic_int_cnt + 1;
+            end
+            
+            if (event_trigger && dynamic_int_allowed) begin
+                dynamic_int_pending <= 1'b1;
+                dynamic_int_cnt <= 0;
+            end else if (o_int) begin
+                dynamic_int_pending <= 1'b0;
+            end
+        end
+    end
+
+    // Combined interrupt generation
+    assign o_int = int_enable && ctx.cfg_interrupt_msienable && 
+                  (static_int_trigger || (dynamic_int_pending && dynamic_int_allowed));
+
+    // MSI interrupt control
+    always @(posedge clk_pcie) begin
+        if (rst) begin
+            cfg_int_valid <= 1'b0;
+            cfg_msg_num <= 5'b0;
+            cfg_int_assert <= 1'b0;
+            cfg_int_di <= 8'b0;
+            cfg_int_stat <= 1'b0;
+        end else if (cfg_int_ready && cfg_int_valid) begin
+            // Clear interrupt when acknowledged
+            cfg_int_valid <= 1'b0;
+            cfg_int_assert <= 1'b0;
+            cfg_int_stat <= 1'b0;
+        end else if (o_int) begin
+            // Generate interrupt
+            cfg_int_valid <= 1'b1;
+            cfg_int_assert <= 1'b1;
+            cfg_msg_num <= static_int_trigger ? 5'h0 : 5'h1; // Different vectors for static/dynamic
+            cfg_int_di <= static_int_trigger ? 8'h00 : 8'h01; // Different data for static/dynamic
+            cfg_int_stat <= 1'b1;
+        end
+    end
+   
+     // ------------------------------------------------------------------------
     // REGISTER FILE: READ-ONLY LAYOUT/SPECIFICATION
     // ------------------------------------------------------------------------
      
     // MAGIC
-    assign base_address_register = base_address_register_reg;
     assign ro[15:0]     = 16'h2301;                     // +000: MAGIC
     // SPECIAL
     assign ro[16]       = ctx.cfg_mgmt_rd_en;           // +002: SPECIAL
@@ -185,7 +272,6 @@ module pcileech_pcie_cfg_a7(
     assign ro[347]      = rwi_cfgrd_valid;              //
     assign ro[351:348]  = rwi_cfgrd_byte_en;            //
     assign ro[383:352]  = rwi_cfgrd_data;               // +02C:
-    // 0030 - 
     
     
     // ------------------------------------------------------------------------
@@ -196,14 +282,12 @@ module pcileech_pcie_cfg_a7(
     localparam integer  RWPOS_CFG_RD_EN                 = 16;
     localparam integer  RWPOS_CFG_WR_EN                 = 17;
     localparam integer  RWPOS_CFG_WAIT_COMPLETE         = 18;
-    localparam integer  RWPOS_CFG_STATIC_TLP_TX_EN      = 19;
     localparam integer  RWPOS_CFG_CFGSPACE_STATUS_CL_EN = 20;
     localparam integer  RWPOS_CFG_CFGSPACE_COMMAND_EN   = 21;
     
     task pcileech_pcie_cfg_a7_initialvalues;        // task is non automatic
         begin
             out_wren <= 1'b0;
-            
             rwi_cfg_mgmt_rd_en <= 1'b0;
             rwi_cfg_mgmt_wr_en <= 1'b0;
             base_address_register_reg <= 32'h00000000;
@@ -213,11 +297,11 @@ module pcileech_pcie_cfg_a7(
             // SPECIAL START TASK BLOCK (write 1 to start action)
             rw[16]      <= 0;                       // +002: CFG RD EN
             rw[17]      <= 0;                       //       CFG WR EN
-            rw[18]      <= 0;                       //       WAIT FOR PCIe CFG SPACE RD/WR COMPLETION BEFORE ACCEPT NEW FIFO READ/WRITES
-            rw[19]      <= 0;                       //       TLP_STATIC TX ENABLE
-	    rw[20]      <= 0;                       //       CFGSPACE_STATUS_REGISTER_AUTO_CLEAR [master abort flag]
-	    rw[21]      <= 1;                       //       CFGSPACE_COMMAND_REGISTER_AUTO_SET [bus master and other flags (set in rw[143:128] <= 16'h....;)]
+            rw[18]      <= 0;                       //       WAIT FOR PCIe CFG SPACE RD/WR COMPLETION
+            rw[20]      <= 1;                       //       CFGSPACE_STATUS_REGISTER_AUTO_CLEAR
+            rw[21]      <= 0;                       //       CFGSPACE_COMMAND_REGISTER_AUTO_SET
             rw[31:22]   <= 0;                       //       RESERVED FUTURE
+            
             // SIZEOF / BYTECOUNT [little-endian]
             rw[63:32]   <= $bits(rw) >> 3;          // +004: bytecount [little endian]
             // DSN
@@ -228,6 +312,7 @@ module pcileech_pcie_cfg_a7(
             rw[170]     <= 0;                       //       cfg_mgmt_wr_readonly
             rw[171]     <= 0;                       //       cfg_mgmt_wr_rw1c_as_rw
             rw[175:172] <= 4'hf;                    //       cfg_mgmt_byte_en
+            
             // PCIe PL PHY
             rw[176]     <= 0;                       // +016: pl_directed_link_auton
             rw[178:177] <= 0;                       //       pl_directed_link_change
@@ -237,12 +322,7 @@ module pcileech_pcie_cfg_a7(
             rw[183]     <= 0;                       //       pl_transmit_hot_rst
             rw[184]     <= 0;                       // +017: pl_downstream_deemph_source
             rw[191:185] <= 0;                       //       SLACK  
-            // PCIe INTERRUPT
-            rw[199:192] <= 0;                       // +018: cfg_interrupt_di
-            rw[204:200] <= 0;                       // +019: cfg_pciecap_interrupt_msgnum
-            rw[205]     <= 0;                       //       cfg_interrupt_assert
-            rw[206]     <= 0;                       //       cfg_interrupt
-            rw[207]     <= 0;                       //       cfg_interrupt_stat
+            
             // PCIe CTRL
             rw[209:208] <= 0;                       // +01A: cfg_pm_force_state
             rw[210]     <= 0;                       //       cfg_pm_force_state_en
@@ -256,27 +336,15 @@ module pcileech_pcie_cfg_a7(
             rw[218]     <= 1;                       //       rx_np_req
             rw[219]     <= 1;                       //       tx_cfg_gnt
             rw[223:220] <= 0;                       //       SLACK 
-            // PCIe STATIC TLP TRANSMIT
-            rw[224+:8]  <= 0;                       // +01C: TLP_STATIC TLP DWORD VALID [each-2bit: [0] = last, [1] = valid] [TLP DWORD 0-3]
-            rw[232+:8]  <= 0;                       // +01D: TLP_STATIC TLP DWORD VALID [each-2bit: [0] = last, [1] = valid] [TLP DWORD 4-7]
-            rw[240+:16] <= 0;                       // +01E: TLP_STATIC TLP TX SLEEP (ticks) [little-endian]
-            rw[256+:384] <= 0;                      // +020: TLP_STATIC TLP [8*32-bit hdr+data]
-            rw[640+:32] <= 0;                       // +050: TLP_STATIC TLP RETRANSMIT COUNT
-            // PCIe STATUS register clear timer
-            rw[672+:32] <= 62500;                   // +054: CFGSPACE_STATUS_CLEAR TIMER (ticks) [little-endian] [default = 1ms - 62.5k @ 62.5MHz]
             
+            // PCIe STATUS register clear timer
+            rw[672+:32] <= 62500;                   // +054: CFGSPACE_STATUS_CLEAR TIMER
         end
     endtask
-    reg[7:0] cfg_int_di;
-    reg[4:0] cfg_msg_num;
-    reg cfg_int_assert;
-    reg cfg_int_valid;
-    wire cfg_int_ready = ctx.cfg_interrupt_rdy;
-    reg cfg_int_stat; 
-
+    
+    // PCIe Interface Signal Assignments
     assign ctx.cfg_mgmt_rd_en               = rwi_cfg_mgmt_rd_en & ~ctx.cfg_mgmt_rd_wr_done;
     assign ctx.cfg_mgmt_wr_en               = rwi_cfg_mgmt_wr_en & ~ctx.cfg_mgmt_rd_wr_done;
-    
     assign ctx.cfg_dsn                      = rw[127:64];
     assign ctx.cfg_mgmt_di                  = rw[159:128];
     assign ctx.cfg_mgmt_dwaddr              = rw[169:160];
@@ -284,6 +352,7 @@ module pcileech_pcie_cfg_a7(
     assign ctx.cfg_mgmt_wr_rw1c_as_rw       = rw[171];
     assign ctx.cfg_mgmt_byte_en             = rw[175:172];
     
+    // PCIe Physical Layer Assignments
     assign ctx.pl_directed_link_auton       = rw[176];
     assign ctx.pl_directed_link_change      = rw[178:177];
     assign ctx.pl_directed_link_speed       = rw[179];
@@ -292,18 +361,14 @@ module pcileech_pcie_cfg_a7(
     assign ctx.pl_transmit_hot_rst          = rw[183];
     assign ctx.pl_downstream_deemph_source  = rw[184];
     
-    // assign ctx.cfg_interrupt_di             = rw[199:192];
-    // assign ctx.cfg_pciecap_interrupt_msgnum = rw[204:200];
-    // assign ctx.cfg_interrupt_assert         = rw[205];
-    // assign ctx.cfg_interrupt                = rw[206];
-    // assign ctx.cfg_interrupt_stat           = rw[207];
-
+    // Interrupt Interface Assignments
     assign ctx.cfg_interrupt_di             = cfg_int_di;
     assign ctx.cfg_pciecap_interrupt_msgnum = cfg_msg_num;
     assign ctx.cfg_interrupt_assert         = cfg_int_assert;
     assign ctx.cfg_interrupt                = cfg_int_valid;
     assign ctx.cfg_interrupt_stat           = cfg_int_stat;
-
+    
+    // Power Management Assignments
     assign ctx.cfg_pm_force_state           = rw[209:208];
     assign ctx.cfg_pm_force_state_en        = rw[210];
     assign ctx.cfg_pm_halt_aspm_l0s         = rw[211];
@@ -316,205 +381,113 @@ module pcileech_pcie_cfg_a7(
     assign ctx.rx_np_req                    = rw[218];
     assign ctx.tx_cfg_gnt                   = rw[219];
     
-//    assign tlps_static.tdata[127:0]         = rwi_tlp_static_2nd ? {
-//        rw[(256+32*7+00)+:8], rw[(256+32*7+08)+:8], rw[(256+32*7+16)+:8], rw[(256+32*7+24)+:8],   // STATIC TLP DWORD7
-//        rw[(256+32*6+00)+:8], rw[(256+32*6+08)+:8], rw[(256+32*6+16)+:8], rw[(256+32*6+24)+:8],   // STATIC TLP DWORD6
-//        rw[(256+32*5+00)+:8], rw[(256+32*5+08)+:8], rw[(256+32*5+16)+:8], rw[(256+32*5+24)+:8],   // STATIC TLP DWORD5
-//        rw[(256+32*4+00)+:8], rw[(256+32*4+08)+:8], rw[(256+32*4+16)+:8], rw[(256+32*4+24)+:8]    // STATIC TLP DWORD4
-//    } : {
-//        rw[(256+32*3+00)+:8], rw[(256+32*3+08)+:8], rw[(256+32*3+16)+:8], rw[(256+32*3+24)+:8],   // STATIC TLP DWORD3
-//        rw[(256+32*2+00)+:8], rw[(256+32*2+08)+:8], rw[(256+32*2+16)+:8], rw[(256+32*2+24)+:8],   // STATIC TLP DWORD2
-//        rw[(256+32*1+00)+:8], rw[(256+32*1+08)+:8], rw[(256+32*1+16)+:8], rw[(256+32*1+24)+:8],   // STATIC TLP DWORD1
-//        rw[(256+32*0+00)+:8], rw[(256+32*0+08)+:8], rw[(256+32*0+16)+:8], rw[(256+32*0+24)+:8]    // STATIC TLP DWORD0
-//    };
-//    assign tlps_static.tkeepdw              = rwi_tlp_static_2nd ? { rw[224+2*7], rw[224+2*6], rw[224+2*5], rw[224+2*4] } : { rw[224+2*3], rw[224+2*2], rw[224+2*1], rw[224+2*0] };
-//    assign tlps_static.tlast                = rwi_tlp_static_2nd || rw[224+2*3+1] || rw[224+2*2+1] || rw[224+2*1+1] || rw[224+2*0+1];
-//    assign tlps_static.tuser[0]             = !rwi_tlp_static_2nd;
-//    assign tlps_static.tvalid               = rwi_tlp_static_valid && tlps_static.tkeepdw[0];
-//    assign tlps_static.has_data             = rwi_tlp_static_has_data;
-        bit msix_valid;
-        bit msix_has_data;
-        bit[127:0] msix_tlp;
-        assign tlps_static.tdata[127:0] = msix_tlp; 
-        assign tlps_static.tkeepdw  = 4'hf;
-        assign tlps_static.tlast   = 1'b1;
-        assign tlps_static.tuser[0] = 1'b1;
-        assign tlps_static.tvalid   = msix_valid;
-        assign tlps_static.has_data   = msix_has_data;
-        
     assign pcie_id                          = ro[79:64];
     
     // ------------------------------------------------------------------------
-    // STATE MACHINE / LOGIC FOR READ/WRITE AND OTHER HOUSEKEEPING TASKS
+    // Command and Status Register Handling
     // ------------------------------------------------------------------------
     
-    integer i_write, i_tlpstatic;
     wire [15:0] in_cmd_address_byte = in_dout[31:16];
     wire [17:0] in_cmd_address_bit  = {in_cmd_address_byte[14:0], 3'b000};
     wire [15:0] in_cmd_value        = {in_dout[48+:8], in_dout[56+:8]};
     wire [15:0] in_cmd_mask         = {in_dout[32+:8], in_dout[40+:8]};
     wire        f_rw                = in_cmd_address_byte[15]; 
-    wire [15:0] in_cmd_data_in      = (in_cmd_address_bit < (f_rw ? $bits(rw) : $bits(ro))) ? (f_rw ? rw[in_cmd_address_bit+:16] : ro[in_cmd_address_bit+:16]) : 16'h0000;
+    wire [15:0] in_cmd_data_in      = (in_cmd_address_bit < (f_rw ? $bits(rw) : $bits(ro))) ? 
+                                     (f_rw ? rw[in_cmd_address_bit+:16] : ro[in_cmd_address_bit+:16]) : 16'h0000;
     wire        in_cmd_read         = in_dout[12] & in_valid;
     wire        in_cmd_write        = in_dout[13] & in_cmd_address_byte[15] & in_valid;
-    wire        pcie_cfg_rw_en      = rwi_cfg_mgmt_rd_en | rwi_cfg_mgmt_wr_en | rw[RWPOS_CFG_RD_EN] | rw[RWPOS_CFG_WR_EN];
-    // in_rden = request data from incoming fifo. Only do this if there is space
-    // in the output fifo and every 2nd clock cycle (in case a resulting write
-    // starts an action that will last longer than a single clock there must be
-    // time to react and stop reading incoming read/writes until processed).
-    assign in_rden = tickcount64[1] & ~pcie_cfg_rx_almost_full & ( ~rw[RWPOS_CFG_WAIT_COMPLETE] | ~pcie_cfg_rw_en);
-    wire      [31:0] HDR_MEMWR64 = 32'b01000000_00000000_00000000_00000001;
-   // localparam [31:0] MWR64_DW2   = {, 8'b00000000, 8'b00001111};
-    wire       [31:0] MWR64_DW2  = {`_bs16(pcie_id), 8'b00000000, 8'b00001111};
-    wire       [31:0] MWR64_DW3  = {i_addr[31:2], 2'b0};
-    wire       [31:0] MWR64_DW4  = {i_data};
-    wire o_int;
+    wire        pcie_cfg_rw_en      = rwi_cfg_mgmt_rd_en | rwi_cfg_mgmt_wr_en | 
+                                     rw[RWPOS_CFG_RD_EN] | rw[RWPOS_CFG_WR_EN];
+    
+    // FIFO read enable control
+    assign in_rden = tick_count[1] & ~pcie_cfg_rx_almost_full & 
+                    (~rw[RWPOS_CFG_WAIT_COMPLETE] | ~pcie_cfg_rw_en);
+    
+    // ------------------------------------------------------------------------
+    // Main Control Logic
+    // ------------------------------------------------------------------------
+    
     initial pcileech_pcie_cfg_a7_initialvalues();
     
-    always @ ( posedge clk_pcie )
-        if ( rst )
+    always @(posedge clk_pcie) begin
+        if (rst) begin
             pcileech_pcie_cfg_a7_initialvalues();
-        else
-            begin
-                // READ config
-                out_wren <= in_cmd_read;
-                if ( in_cmd_read )
-                    begin
-                        out_data[31:16] <= in_cmd_address_byte;
-                        out_data[15:0]  <= {in_cmd_data_in[7:0], in_cmd_data_in[15:8]};
-                    end
-
-                // WRITE config
-                if ( in_cmd_write )
-                    for ( i_write = 0; i_write < 16; i_write = i_write + 1 )
-                        begin
-                            if ( in_cmd_mask[i_write] )
-                                rw[in_cmd_address_bit+i_write] <= in_cmd_value[i_write];
-                        end
-
-                // STATUS REGISTER CLEAR
-                if ( (rw[RWPOS_CFG_CFGSPACE_STATUS_CL_EN] | rw[RWPOS_CFG_CFGSPACE_COMMAND_EN]) & ~in_cmd_read & ~in_cmd_write & ~rw[RWPOS_CFG_RD_EN] & ~rw[RWPOS_CFG_WR_EN] & ~rwi_cfg_mgmt_rd_en & ~rwi_cfg_mgmt_wr_en )
-                    if ( rwi_count_cfgspace_status_cl < rw[672+:32] )
-                        rwi_count_cfgspace_status_cl <= rwi_count_cfgspace_status_cl + 1;
-                    else begin
-                        rwi_count_cfgspace_status_cl <= 0;
-                        rw[RWPOS_CFG_WR_EN] <= 1'b1;
-                        rw[143:128] <= 16'h0007;                            // cfg_mgmt_di: command register [update to set individual command register bits]
-                        rw[159:144] <= 16'hff00;                            // cfg_mgmt_di: status register [do not update]
-                        rw[169:160] <= 1;                                   // cfg_mgmt_dwaddr
-                        rw[170]     <= 0;                                   // cfg_mgmt_wr_readonly
-                        rw[171]     <= 0;                                   // cfg_mgmt_wr_rw1c_as_rw
-                        rw[172]     <= rw[RWPOS_CFG_CFGSPACE_COMMAND_EN];   // cfg_mgmt_byte_en: command register
-                        rw[173]     <= rw[RWPOS_CFG_CFGSPACE_COMMAND_EN];   // cfg_mgmt_byte_en: command register
-                        rw[174]     <= 0;                                   // cfg_mgmt_byte_en: status register
-                        rw[175]     <= rw[RWPOS_CFG_CFGSPACE_STATUS_CL_EN]; // cfg_mgmt_byte_en: status register
-                    end
-
-                if ((base_address_register_reg == 32'h00000000) | (base_address_register_reg == 32'hFFFFC004) |(base_address_register_reg == 32'h00000004) )
-                    if ( ~in_cmd_read & ~in_cmd_write & ~rw[RWPOS_CFG_RD_EN] & ~rw[RWPOS_CFG_WR_EN] & ~rwi_cfg_mgmt_rd_en & ~rwi_cfg_mgmt_wr_en )
-                        begin
-                            rw[RWPOS_CFG_RD_EN] <= 1'b1;
-                            rw[169:160] <= 6;                                   // cfg_mgmt_dwaddr
-                            rw[172]     <= 0;                                   // cfg_mgmt_byte_en
-                            rw[173]     <= 0;                                   // cfg_mgmt_byte_en
-                            rw[174]     <= 0;                                   // cfg_mgmt_byte_en
-                            rw[175]     <= 0;                                   // cfg_mgmt_byte_en
-                        end
-
-                // CONFIG SPACE READ/WRITE                        
-                if ( ctx.cfg_mgmt_rd_wr_done )
-                    begin
-                        //
-                        // if BAR0 was requested, lets save it.
-                        //
-                        if ((base_address_register_reg == 32'h00000000) | (base_address_register_reg == 32'hFFFFC004)  |(base_address_register_reg == 32'h00000004))
-                            if ((ctx.cfg_mgmt_dwaddr == 8'h06) & rwi_cfg_mgmt_rd_en)
-                                    base_address_register_reg <= ctx.cfg_mgmt_do;
-
-
-                            rwi_cfg_mgmt_rd_en  <= 1'b0;
-                            rwi_cfg_mgmt_wr_en  <= 1'b0;
-                            rwi_cfgrd_valid     <= 1'b1;
-                            rwi_cfgrd_addr      <= ctx.cfg_mgmt_dwaddr;
-                            rwi_cfgrd_data      <= ctx.cfg_mgmt_do;
-                            rwi_cfgrd_byte_en   <= ctx.cfg_mgmt_byte_en;
-                    end
-                else if ( rw[RWPOS_CFG_RD_EN] )
-                    begin
-                        rw[RWPOS_CFG_RD_EN] <= 1'b0;
-                        rwi_cfg_mgmt_rd_en  <= 1'b1;
-                        rwi_cfgrd_valid     <= 1'b0;
-                    end
-                else if ( rw[RWPOS_CFG_WR_EN] )
-                    begin
-                        rw[RWPOS_CFG_WR_EN] <= 1'b0;
-                        rwi_cfg_mgmt_wr_en  <= 1'b1;
-                        rwi_cfgrd_valid     <= 1'b0;
-                    end
-                    
-                // STATIC_TLP TRANSMIT
-//                if ( (rwi_tlp_static_valid && rwi_tlp_static_2nd) || ~rw[RWPOS_CFG_STATIC_TLP_TX_EN] ) begin    // STATE (3)
-//                    rwi_tlp_static_valid    <= 1'b0;
-//                    rwi_tlp_static_has_data <= 1'b0;
-//                end
-//                else if ( rwi_tlp_static_has_data && tlps_static.tready && rwi_tlp_static_2nd ) begin  // STATE (1)
-//                     rwi_tlp_static_valid   <= 1'b1;
-//                     rwi_tlp_static_2nd     <= 1'b0;
-//                end
-//                else if ( rwi_tlp_static_has_data && tlps_static.tready && !rwi_tlp_static_2nd ) begin // STATE (2)
-//                     rwi_tlp_static_valid   <= 1'b1;
-//                     rwi_tlp_static_2nd     <= 1'b1;
-//                end
-//                else if ( ((tickcount64[0+:16] & rw[240+:16]) == rw[240+:16]) & (rw[640+:32] > 0) & rw[224+2*0] ) begin   // IDLE STATE (0)
-//                    rwi_tlp_static_has_data <= 1'b1;
-//                    rwi_tlp_static_2nd      <= 1'b1;
-//                    rw[640+:32] <= rw[640+:32] - 1;     // count - 1
-//                    if ( rw[640+:32] == 32'h00000001 )
-//                        rw[RWPOS_CFG_STATIC_TLP_TX_EN] <= 1'b0;
-//                end
-                
+        end else begin
+            // READ config
+            out_wren <= in_cmd_read;
+            if (in_cmd_read) begin
+                out_data[31:16] <= in_cmd_address_byte;
+                out_data[15:0]  <= {in_cmd_data_in[7:0], in_cmd_data_in[15:8]};
             end
-//reg o_int_reg = 1'b0;
 
-always @ ( posedge clk_pcie ) begin
-   if ( rst ) begin
-       cfg_int_valid <= 1'b0;
-       cfg_msg_num <= 5'b0;
-       cfg_int_assert <= 1'b0;
-       cfg_int_di <= 8'b0;
-       cfg_int_stat <= 1'b0;
-   end else if (cfg_int_ready && cfg_int_valid) begin
-       cfg_int_valid <= 1'b0;
-   end else if (o_int) begin
-       cfg_int_valid <= 1'b0;
-   end
-end
-always @ ( posedge clk_pcie ) begin
-   if ( rst ) begin
-       msix_valid <= 1'b0;
-       msix_has_data <= 1'b0;
-       msix_tlp <= 127'b0;
-   end else if (msix_valid) begin
-       msix_valid <= 1'b0;
-   end else if (msix_has_data && tlps_static.tready) begin
-       msix_valid <= 1'b1;
-       msix_has_data <= 1'b0;
-   end else if (o_int && i_valid) begin
-      // msix_valid <= 1'b1;
-       msix_has_data <= 1'b1;
-       msix_tlp <= {MWR64_DW4, MWR64_DW3, MWR64_DW2,HDR_MEMWR64};
-   end
-end
-time int_cnt = 0;
-always @ ( posedge clk_pcie ) begin
-   if (rst) begin
-       int_cnt <= 0;
-   end else if (int_cnt == 32'd100000) begin
-       int_cnt <= 0;
-   end else if (int_enable) begin
-       int_cnt <= int_cnt + 1;
-   end
-end
+            // WRITE config
+            if (in_cmd_write) begin
+                for (integer i_write = 0; i_write < 16; i_write = i_write + 1) begin
+                    if (in_cmd_mask[i_write])
+                        rw[in_cmd_address_bit+i_write] <= in_cmd_value[i_write];
+                end
+            end
 
-	assign o_int = (int_cnt == 32'd250000);
+            // STATUS REGISTER CLEAR
+            if ((rw[RWPOS_CFG_CFGSPACE_STATUS_CL_EN] | rw[RWPOS_CFG_CFGSPACE_COMMAND_EN]) & 
+                ~in_cmd_read & ~in_cmd_write & ~rw[RWPOS_CFG_RD_EN] & ~rw[RWPOS_CFG_WR_EN] & 
+                ~rwi_cfg_mgmt_rd_en & ~rwi_cfg_mgmt_wr_en) begin
+                
+                if (rwi_count_cfgspace_status_cl < rw[672+:32])
+                    rwi_count_cfgspace_status_cl <= rwi_count_cfgspace_status_cl + 1;
+                else begin
+                    rwi_count_cfgspace_status_cl <= 0;
+                    rw[RWPOS_CFG_WR_EN] <= 1'b1;
+                    rw[143:128] <= 16'h0007;
+                    rw[159:144] <= 16'hff00;
+                    rw[169:160] <= 1;
+                    rw[170]     <= 0;
+                    rw[171]     <= 0;
+                    rw[172]     <= rw[RWPOS_CFG_CFGSPACE_COMMAND_EN];
+                    rw[173]     <= rw[RWPOS_CFG_CFGSPACE_COMMAND_EN];
+                    rw[174]     <= 0;
+                    rw[175]     <= rw[RWPOS_CFG_CFGSPACE_STATUS_CL_EN];
+                end
+            end
+
+            // BAR Configuration
+            if ((base_address_register_reg == 32'h00000000) || 
+                (base_address_register_reg == 32'hFFFFC004) ||
+                (base_address_register_reg == 32'h00000004)) begin
+                
+                if (~in_cmd_read & ~in_cmd_write & ~rw[RWPOS_CFG_RD_EN] & 
+                    ~rw[RWPOS_CFG_WR_EN] & ~rwi_cfg_mgmt_rd_en & ~rwi_cfg_mgmt_wr_en) begin
+                    rw[RWPOS_CFG_RD_EN] <= 1'b1;
+                    rw[169:160] <= 6;
+                    rw[175:172] <= 4'h0;
+                end
+            end
+
+            // CONFIG SPACE READ/WRITE                        
+            if (ctx.cfg_mgmt_rd_wr_done) begin
+                if ((base_address_register_reg == 32'h00000000) || 
+                    (base_address_register_reg == 32'hFFFFC004) ||
+                    (base_address_register_reg == 32'h00000004)) begin
+                    if ((ctx.cfg_mgmt_dwaddr == 8'h06) & rwi_cfg_mgmt_rd_en)
+                        base_address_register_reg <= ctx.cfg_mgmt_do;
+                end
+
+                rwi_cfg_mgmt_rd_en  <= 1'b0;
+                rwi_cfg_mgmt_wr_en  <= 1'b0;
+                rwi_cfgrd_valid     <= 1'b1;
+                rwi_cfgrd_addr      <= ctx.cfg_mgmt_dwaddr;
+                rwi_cfgrd_data      <= ctx.cfg_mgmt_do;
+                rwi_cfgrd_byte_en   <= ctx.cfg_mgmt_byte_en;
+            end else if (rw[RWPOS_CFG_RD_EN]) begin
+                rw[RWPOS_CFG_RD_EN] <= 1'b0;
+                rwi_cfg_mgmt_rd_en  <= 1'b1;
+                rwi_cfgrd_valid     <= 1'b0;
+            end else if (rw[RWPOS_CFG_WR_EN]) begin
+                rw[RWPOS_CFG_WR_EN] <= 1'b0;
+                rwi_cfg_mgmt_wr_en  <= 1'b1;
+                rwi_cfgrd_valid     <= 1'b0;
+            end
+        end
+    end
+
 endmodule
