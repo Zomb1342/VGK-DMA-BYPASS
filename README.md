@@ -1,12 +1,5 @@
-## WARNING
-Lately, someone's been pretending to be me on Telegram, claiming to sell "aceking firmware." Just to clear things up: **I only use Discord for contact,Stay safe and don't get scammed!**
-
-
-I have released a new project, EmuScan, for detecting emulated firmware and have answered some frequently asked questions.
-
-[emuscan](https://github.com/Manut0/emuscan)
-
-Thanks to my friend kilmu1337。I will show you how to make your firmware "active"
+My version of Kilmu's MSI Interrupts, I removed the MSIX functionality, the regular pcileech_pci_cfg_a7.sv file generates static 'heartbeat' interrupts and dynamic interrupts which is not realistic but hey 
+interrupts are interrupts.
 
 # What is an active device?
 An "active device" is actually a misnomer used by firmware developers. Instead of saying a device is "active," it's more accurate to say that the device frequently initiates DMA (Direct Memory Access) transfers. After a DMA transfer is completed, an interrupt is used to notify the CPU that the data has been successfully transferred. This mechanism is often referred to as the "doorbell" mechanism, which is a very apt analogy—just like a delivery person ringing the doorbell to notify you that your package has arrived, the device "rings the doorbell" to inform the CPU that the data is ready.
